@@ -1,0 +1,19 @@
+[workspace]
+name = "stateful_quadrature"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+version = "0.1.0"
+
+[tasks]
+test = "python -m unittest discover -s tests -v"
+
+[dependencies]
+python = ">=3.11,<3.15"
+numpy = ">=2.0,<3.0"
+
+[feature.test.dependencies]
+scipy = ">=1.13,<2.0"
+
+[environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }

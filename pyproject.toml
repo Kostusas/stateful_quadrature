@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stateful-quadrature"
+version = "0.1.0"
+description = "Stateful adaptive quadrature with exact node reuse."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.0"]
+authors = [{ name = "Kostas Vilkelis" }]
+
+[tool.setuptools.packages.find]
+include = ["stateful_quadrature*"]

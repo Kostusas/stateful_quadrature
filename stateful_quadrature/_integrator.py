@@ -1,14 +1,15 @@
-"""Stateful adaptive quadrature built around exact node reuse."""
+"""Leaf-only stateful adaptive cubature."""
 
 from __future__ import annotations
 
+import heapq
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
 
-from ._rules import NestedRule, map_rule, resolve_rule
+from ._rules import NestedRule, resolve_rule
 
 
 Kernel = Callable[[np.ndarray], np.ndarray]
@@ -17,15 +18,22 @@ Evaluator = Callable[[np.ndarray, np.ndarray, Any], np.ndarray]
 
 @dataclass(slots=True)
 class IntegrationResult:
-    """Result of a single parameter-specific integration call."""
+    """Result of a single stateful integration call.
+
+    Status values:
+
+    - ``"converged"``: the requested tolerance was met,
+    - ``"max_subdivisions"``: refinement stopped after hitting ``max_subdivisions``,
+    - ``"not_finite"``: the evaluator produced a non-finite estimate or error.
+    """
 
     estimate: Any
     error: Any
     status: str
     n_kernel_evals: int
     n_evaluator_evals: int
-    n_regions: int
-    n_cached_nodes: int
+    n_leaves: int
+    n_leaf_nodes: int
     subdivisions: int
 
 
@@ -37,28 +45,18 @@ class _CallStats:
 
 
 @dataclass(slots=True)
-class _Region:
+class _Leaf:
+    leaf_id: int
     a: np.ndarray
     b: np.ndarray
-    node_coords: np.ndarray
-    high_weights: np.ndarray
-    low_weights: np.ndarray
-    node_ids: np.ndarray | None = None
+    payload: np.ndarray | None = None
     estimate: np.ndarray | np.generic | None = None
     error: np.ndarray | np.generic | None = None
-
-    @property
-    def priority(self) -> float:
-        if self.error is None:
-            return float("inf")
-        error = np.asarray(self.error)
-        if not np.all(np.isfinite(error)):
-            return float("inf")
-        return float(np.max(np.abs(error)))
+    priority: float = field(default=float("inf"))
 
 
 class StatefulIntegrator:
-    """Adaptive quadrature engine that reuses exact cached kernel evaluations."""
+    """Adaptive cubature engine with a leaf-only mesh and per-leaf payload cache."""
 
     def __init__(
         self,
@@ -69,8 +67,22 @@ class StatefulIntegrator:
         rule: str = "auto",
         dtype: np.dtype | type = np.float64,
         batch_size: int | None = None,
-        points: list[np.ndarray | list[float] | float] | None = None,
     ) -> None:
+        """Create a stateful integrator on a finite rectangular domain.
+
+        Args:
+            a: Lower integration bounds. Reversed bounds are allowed and flip the result sign.
+            b: Upper integration bounds. Bounds must be finite.
+            kernel: Expensive callback evaluated at rule nodes. It must return a numeric array
+                whose leading dimension matches the input batch size.
+            evaluator: Cheap callback that combines points, cached kernel payloads, and the
+                parameter object passed to ``integrate(...)``.
+            rule: ``"auto"``, ``"gk21"``, or ``"genz_malik"``. ``"auto"`` selects ``"gk21"``
+                in 1D and ``"genz_malik"`` otherwise.
+            dtype: Floating-point dtype used for the integration domain and rule weights.
+            batch_size: Optional maximum number of points passed to ``kernel`` and ``evaluator``
+                per callback invocation.
+        """
         self.kernel = kernel
         self.evaluator = evaluator
         self.dtype = np.dtype(dtype)
@@ -84,32 +96,70 @@ class StatefulIntegrator:
         a_arr = self._as_point(a)
         b_arr = self._as_point(b)
         if np.any(~np.isfinite(a_arr)) or np.any(~np.isfinite(b_arr)):
-            raise ValueError("v1 only supports finite integration bounds")
+            raise ValueError("StatefulIntegrator only supports finite integration bounds")
 
         self._orientation_sign = -1 if np.count_nonzero(a_arr > b_arr) % 2 else 1
         self.a = np.minimum(a_arr, b_arr)
         self.b = np.maximum(a_arr, b_arr)
-
         self.ndim = int(self.a.size)
+
         self.rule_name = self._resolve_rule_name(rule)
         self._rule: NestedRule = resolve_rule(self.rule_name, self.ndim, self.dtype)
+        self._n_rule_nodes = self._rule.n_nodes
+        self._child_sides = tuple(itertools.product((0, 1), repeat=self.ndim))
 
-        self._node_index: dict[bytes, int] = {}
-        self._node_coords: list[np.ndarray] = []
-        self._payloads: list[np.ndarray] = []
         self._payload_shape: tuple[int, ...] | None = None
         self._value_shape: tuple[int, ...] | None = None
+        self._next_leaf_id = 0
+        self._leaf_heap: list[tuple[float, int]] = []
+        self._leaves: dict[int, _Leaf] = {}
 
-        initial_regions = self._split_initial_regions(self.a, self.b, points)
-        self._leaf_regions = [self._build_region(left, right) for left, right in initial_regions]
+        root = self._new_leaf(self.a, self.b)
+        self._leaves[root.leaf_id] = root
 
     @property
-    def n_cached_nodes(self) -> int:
-        return len(self._node_coords)
+    def n_leaves(self) -> int:
+        return len(self._leaves)
 
     @property
-    def n_regions(self) -> int:
-        return len(self._leaf_regions)
+    def n_leaf_nodes(self) -> int:
+        return self.n_leaves * self._n_rule_nodes
+
+    def replace_evaluator(self, evaluator: Evaluator) -> "StatefulIntegrator":
+        """Return a new integrator sharing the current live leaf payloads.
+
+        The clone starts from the current adaptive mesh snapshot, reuses cached kernel payloads,
+        and resets only evaluator-dependent state. Future refinement happens independently in the
+        original and cloned integrators.
+        """
+
+        clone = object.__new__(StatefulIntegrator)
+        clone.kernel = self.kernel
+        clone.evaluator = evaluator
+        clone.dtype = self.dtype
+        clone.batch_size = self.batch_size
+        clone._orientation_sign = self._orientation_sign
+        clone.a = self.a.copy()
+        clone.b = self.b.copy()
+        clone.ndim = self.ndim
+        clone.rule_name = self.rule_name
+        clone._rule = self._rule
+        clone._n_rule_nodes = self._n_rule_nodes
+        clone._child_sides = self._child_sides
+        clone._payload_shape = self._payload_shape
+        clone._value_shape = None
+        clone._next_leaf_id = self._next_leaf_id
+        clone._leaf_heap = []
+        clone._leaves = {
+            leaf_id: _Leaf(
+                leaf_id=leaf.leaf_id,
+                a=leaf.a,
+                b=leaf.b,
+                payload=leaf.payload,
+            )
+            for leaf_id, leaf in self._leaves.items()
+        }
+        return clone
 
     def integrate(
         self,
@@ -120,7 +170,21 @@ class StatefulIntegrator:
         max_subdivisions: int | None = 10_000,
         **param_kwargs: Any,
     ) -> IntegrationResult:
-        """Integrate for one parameter value and update the cached adaptive state."""
+        """Integrate for one parameter value and update the live adaptive mesh.
+
+        Pass parameters either as ``params`` or as keyword arguments, but not both. When keyword
+        arguments are used they are bundled into a dictionary and forwarded to ``evaluator`` as
+        the third argument.
+
+        Args:
+            params: Parameter payload passed through to the evaluator.
+            atol: Absolute tolerance. Must be non-negative.
+            rtol: Relative tolerance. Must be non-negative.
+            max_subdivisions: Maximum number of refinement steps for this call. ``None`` allows
+                unbounded refinement.
+            **param_kwargs: Keyword parameters forwarded as a dictionary when ``params`` is not
+                provided.
+        """
 
         if param_kwargs:
             if params is not None:
@@ -132,8 +196,9 @@ class StatefulIntegrator:
             raise ValueError("max_subdivisions must be non-negative")
 
         stats = _CallStats()
-        self._ensure_region_nodes(self._leaf_regions, stats)
-        estimate, error, is_finite = self._evaluate_regions(self._leaf_regions, params, stats)
+        leaf_ids = list(self._leaves)
+        self._ensure_leaf_payloads(leaf_ids, stats)
+        estimate, error, is_finite = self._refresh_leaves(leaf_ids, params, stats, rebuild_heap=True)
         signed_estimate = estimate * self._orientation_sign
 
         while True:
@@ -146,15 +211,21 @@ class StatefulIntegrator:
             if max_subdivisions is not None and stats.subdivisions >= max_subdivisions:
                 return self._build_result("max_subdivisions", signed_estimate, error, stats)
 
-            parent_region, children = self._refine_worst_region()
-            self._ensure_region_nodes(children, stats)
-            child_estimate, child_error, child_finite = self._evaluate_regions(children, params, stats)
+            parent, child_ids = self._split_worst_leaf()
+            self._ensure_leaf_payloads(child_ids, stats)
+            child_estimate, child_error, child_finite = self._refresh_leaves(
+                child_ids,
+                params,
+                stats,
+                rebuild_heap=False,
+            )
 
-            estimate = estimate - parent_region.estimate + child_estimate
-            error = error - parent_region.error + child_error
+            estimate = estimate - np.asarray(parent.estimate) + child_estimate
+            error = error - np.asarray(parent.error) + child_error
             signed_estimate = estimate * self._orientation_sign
             is_finite = child_finite and self._is_finite_result(estimate, error)
             stats.subdivisions += 1
+            self._push_leaves(child_ids)
 
     def _as_point(self, value: np.ndarray | list[float]) -> np.ndarray:
         arr = np.asarray(value, dtype=self.dtype)
@@ -166,79 +237,200 @@ class StatefulIntegrator:
     def _resolve_rule_name(self, rule: str) -> str:
         if rule == "auto":
             return "gk21" if self.ndim == 1 else "genz_malik"
-        if rule not in {"gk15", "gk21", "trapezoid", "genz_malik"}:
+        if rule not in {"gk21", "genz_malik"}:
             raise ValueError(f"unknown rule {rule!r}")
         return rule
 
-    def _build_region(self, a: np.ndarray, b: np.ndarray) -> _Region:
-        node_coords, high_weights, low_weights = map_rule(self._rule, a, b)
-        return _Region(
+    def _new_leaf(self, a: np.ndarray, b: np.ndarray) -> _Leaf:
+        leaf = _Leaf(
+            leaf_id=self._next_leaf_id,
             a=np.array(a, copy=True),
             b=np.array(b, copy=True),
-            node_coords=np.ascontiguousarray(node_coords, dtype=self.dtype),
-            high_weights=np.asarray(high_weights, dtype=self.dtype),
-            low_weights=np.asarray(low_weights, dtype=self.dtype),
         )
+        self._next_leaf_id += 1
+        return leaf
 
-    def _ensure_region_nodes(self, regions: list[_Region], stats: _CallStats) -> None:
-        pending_regions = [region for region in regions if region.node_ids is None]
-        if not pending_regions:
+    def _leaf_batch_size(self) -> int | None:
+        if self.batch_size is None:
+            return None
+        return max(1, self.batch_size // self._n_rule_nodes)
+
+    def _iter_leaf_batches(self, leaf_ids: list[int]):
+        batch_size = self._leaf_batch_size()
+        if batch_size is None:
+            yield leaf_ids
+            return
+        for start in range(0, len(leaf_ids), batch_size):
+            yield leaf_ids[start : start + batch_size]
+
+    def _ensure_leaf_payloads(self, leaf_ids: list[int], stats: _CallStats) -> None:
+        pending = [leaf_id for leaf_id in leaf_ids if self._leaves[leaf_id].payload is None]
+        if not pending:
             return
 
-        all_points = np.concatenate([region.node_coords for region in pending_regions], axis=0)
-        node_ids = self._register_nodes(all_points, stats)
+        for batch_ids in self._iter_leaf_batches(pending):
+            batch = [self._leaves[leaf_id] for leaf_id in batch_ids]
+            centers, half_widths = self._leaf_geometry(batch)
+            nodes = self._map_nodes_batch(centers, half_widths)
+            payloads = self._call_kernel(nodes.reshape(-1, self.ndim), stats)
+            payloads = payloads.reshape((len(batch), self._n_rule_nodes) + self._payload_shape)
+            for index, leaf in enumerate(batch):
+                leaf.payload = np.array(payloads[index], copy=True)
 
-        start = 0
-        for region in pending_regions:
-            stop = start + region.node_coords.shape[0]
-            region.node_ids = node_ids[start:stop]
-            start = stop
+    def _refresh_leaves(
+        self,
+        leaf_ids: list[int],
+        params: Any,
+        stats: _CallStats,
+        *,
+        rebuild_heap: bool,
+    ) -> tuple[np.ndarray | np.generic, np.ndarray | np.generic, bool]:
+        total_estimate: np.ndarray | np.generic | None = None
+        total_error: np.ndarray | np.generic | None = None
+        heap_entries: list[tuple[float, int]] = []
 
-    def _register_nodes(self, points: np.ndarray, stats: _CallStats) -> np.ndarray:
-        points = self._canonicalize_points(points)
-        if points.shape[0] == 0:
-            return np.empty(0, dtype=np.int64)
+        for batch_ids in self._iter_leaf_batches(leaf_ids):
+            batch = [self._leaves[leaf_id] for leaf_id in batch_ids]
+            centers, half_widths = self._leaf_geometry(batch)
+            scales = np.prod(half_widths, axis=1, dtype=self.dtype)
+            nodes = self._map_nodes_batch(centers, half_widths)
+            payloads = np.stack([leaf.payload for leaf in batch], axis=0)
 
-        node_ids = np.empty(points.shape[0], dtype=np.int64)
-        unique_missing_keys: list[bytes] = []
-        unique_missing_points: list[np.ndarray] = []
-        unresolved: list[tuple[int, bytes]] = []
-        pending: dict[bytes, int] = {}
+            values = self._call_evaluator(
+                nodes.reshape(-1, self.ndim),
+                payloads.reshape((len(batch) * self._n_rule_nodes,) + self._payload_shape),
+                params,
+                stats,
+            )
+            values = values.reshape((len(batch), self._n_rule_nodes) + self._value_shape)
 
-        for idx, point in enumerate(points):
-            key = point.tobytes()
-            existing = self._node_index.get(key)
-            if existing is not None:
-                node_ids[idx] = existing
-                continue
+            estimates, errors = self._estimate_leaf_batch(half_widths, scales, values)
+            batch_estimate_total = np.sum(estimates, axis=0)
+            batch_error_total = np.sum(errors, axis=0)
 
-            if key not in pending:
-                pending[key] = len(unique_missing_points)
-                unique_missing_keys.append(key)
-                unique_missing_points.append(point.copy())
-            unresolved.append((idx, key))
+            total_estimate = batch_estimate_total if total_estimate is None else total_estimate + batch_estimate_total
+            total_error = batch_error_total if total_error is None else total_error + batch_error_total
 
-        if unique_missing_points:
-            payloads = self._call_kernel(np.stack(unique_missing_points, axis=0), stats)
-            for key, point, payload in zip(unique_missing_keys, unique_missing_points, payloads, strict=True):
-                node_id = len(self._node_coords)
-                self._node_index[key] = node_id
-                self._node_coords.append(point)
-                self._payloads.append(np.array(payload, copy=True))
+            for index, leaf in enumerate(batch):
+                leaf.estimate = np.array(estimates[index], copy=True)
+                leaf.error = np.array(errors[index], copy=True)
+                leaf.priority = self._priority_from_error(leaf.error)
+                if rebuild_heap:
+                    heap_entries.append((-leaf.priority, leaf.leaf_id))
 
-        for idx, key in unresolved:
-            node_ids[idx] = self._node_index[key]
+        if total_estimate is None or total_error is None:
+            raise RuntimeError("integrator has no active leaves")
 
-        return node_ids
+        if rebuild_heap:
+            self._leaf_heap = heap_entries
+            heapq.heapify(self._leaf_heap)
 
-    def _canonicalize_points(self, points: np.ndarray) -> np.ndarray:
-        arr = np.asarray(points, dtype=self.dtype)
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
-        if arr.ndim != 2 or arr.shape[1] != self.ndim:
-            raise ValueError(f"points must have shape (npoints, {self.ndim})")
-        arr = np.where(arr == 0, self.dtype.type(0), arr)
-        return np.ascontiguousarray(arr)
+        return total_estimate, total_error, self._is_finite_result(total_estimate, total_error)
+
+    def _leaf_geometry(self, leaves: list[_Leaf]) -> tuple[np.ndarray, np.ndarray]:
+        a = np.stack([leaf.a for leaf in leaves], axis=0)
+        b = np.stack([leaf.b for leaf in leaves], axis=0)
+        half_widths = 0.5 * (b - a)
+        centers = 0.5 * (a + b)
+        return centers, half_widths
+
+    def _map_nodes_batch(self, centers: np.ndarray, half_widths: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(
+            centers[:, None, :] + half_widths[:, None, :] * self._rule.reference_nodes[None, :, :]
+        )
+
+    def _estimate_leaf_batch(
+        self,
+        half_widths: np.ndarray,
+        scales: np.ndarray,
+        values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        weights_shape = (len(scales), self._n_rule_nodes) + (1,) * (values.ndim - 2)
+        high_weights = (scales[:, None] * self._rule.high_weights[None, :]).reshape(weights_shape)
+        low_weights = (scales[:, None] * self._rule.low_weights[None, :]).reshape(weights_shape)
+
+        high_estimates = np.sum(values * high_weights, axis=1)
+        low_estimates = np.sum(values * low_weights, axis=1)
+
+        if self.ndim == 1:
+            errors = self._gauss_kronrod_error_batch(
+                half_widths[:, 0],
+                high_weights,
+                values,
+                high_estimates,
+                low_estimates,
+            )
+        else:
+            errors = np.abs(high_estimates - low_estimates)
+        return high_estimates, errors
+
+    def _gauss_kronrod_error_batch(
+        self,
+        half_widths: np.ndarray,
+        high_weights: np.ndarray,
+        values: np.ndarray,
+        high_estimates: np.ndarray,
+        low_estimates: np.ndarray,
+    ) -> np.ndarray:
+        err = np.abs(high_estimates - low_estimates)
+        denom_shape = (len(half_widths),) + (1,) * (high_estimates.ndim - 1)
+        denom = (2.0 * half_widths).reshape(denom_shape)
+        center = np.divide(
+            high_estimates,
+            denom,
+            out=np.zeros_like(high_estimates, dtype=np.result_type(high_estimates, self.dtype)),
+            where=denom != 0,
+        )
+
+        dabs = np.sum(high_weights * np.abs(values - np.expand_dims(center, axis=1)), axis=1)
+        ratio = np.divide(
+            200.0 * err,
+            dabs,
+            out=np.zeros_like(np.asarray(err, dtype=np.result_type(err, np.float64))),
+            where=dabs != 0,
+        )
+        err = np.where((dabs != 0) & (err != 0), dabs * np.minimum(1.0, ratio**1.5), err)
+
+        abs_integrand = np.sum(high_weights * np.abs(values), axis=1)
+        round_err = np.abs(50.0 * np.finfo(self.dtype).eps * abs_integrand)
+        err = np.where(round_err > np.finfo(self.dtype).tiny, np.maximum(err, round_err), err)
+        return err
+
+    def _priority_from_error(self, error: np.ndarray | np.generic) -> float:
+        error_arr = np.asarray(error)
+        if not np.all(np.isfinite(error_arr)):
+            return float("inf")
+        return float(np.max(np.abs(error_arr)))
+
+    def _push_leaves(self, leaf_ids: list[int]) -> None:
+        for leaf_id in leaf_ids:
+            leaf = self._leaves[leaf_id]
+            heapq.heappush(self._leaf_heap, (-leaf.priority, leaf.leaf_id))
+
+    def _split_worst_leaf(self) -> tuple[_Leaf, list[int]]:
+        while self._leaf_heap:
+            _, leaf_id = heapq.heappop(self._leaf_heap)
+            parent = self._leaves.pop(leaf_id, None)
+            if parent is not None:
+                break
+        else:
+            raise RuntimeError("integrator has no active leaves to refine")
+
+        midpoint = 0.5 * (parent.a + parent.b)
+        child_ids: list[int] = []
+        for side in self._child_sides:
+            child_a = parent.a.copy()
+            child_b = parent.b.copy()
+            for axis, upper_half in enumerate(side):
+                if upper_half:
+                    child_a[axis] = midpoint[axis]
+                else:
+                    child_b[axis] = midpoint[axis]
+            child = self._new_leaf(child_a, child_b)
+            self._leaves[child.leaf_id] = child
+            child_ids.append(child.leaf_id)
+
+        return parent, child_ids
 
     def _call_kernel(self, points: np.ndarray, stats: _CallStats) -> np.ndarray:
         outputs: list[np.ndarray] = []
@@ -260,7 +452,9 @@ class StatefulIntegrator:
     ) -> np.ndarray:
         outputs: list[np.ndarray] = []
         for chunk_points, chunk_payloads in zip(
-            self._iter_chunks(points), self._iter_chunks(payloads), strict=True
+            self._iter_chunks(points),
+            self._iter_chunks(payloads),
+            strict=True,
         ):
             values = np.asarray(self.evaluator(chunk_points, chunk_payloads, params))
             values = self._validate_batch_output("evaluator", values, chunk_points.shape[0], self._value_shape)
@@ -296,163 +490,12 @@ class StatefulIntegrator:
         for start in range(0, values.shape[0], self.batch_size):
             yield values[start : start + self.batch_size]
 
-    def _evaluate_regions(
-        self,
-        regions: list[_Region],
-        params: Any,
-        stats: _CallStats,
-    ) -> tuple[np.ndarray, np.ndarray, bool]:
-        active_ids = sorted({int(node_id) for region in regions for node_id in region.node_ids})
-        coords = np.stack([self._node_coords[node_id] for node_id in active_ids], axis=0)
-        payloads = np.stack([self._payloads[node_id] for node_id in active_ids], axis=0)
-        values = self._call_evaluator(coords, payloads, params, stats)
-
-        lookup = np.full(len(self._node_coords), -1, dtype=np.int64)
-        lookup[np.asarray(active_ids, dtype=np.int64)] = np.arange(len(active_ids), dtype=np.int64)
-
-        total_estimate: np.ndarray | np.generic | None = None
-        total_error: np.ndarray | np.generic | None = None
-
-        for region in regions:
-            region_values = values[lookup[region.node_ids]]
-            region.estimate, region.error = self._estimate_region(region, region_values)
-
-            if total_estimate is None:
-                total_estimate = np.array(region.estimate, copy=True)
-                total_error = np.array(region.error, copy=True)
-            else:
-                total_estimate = total_estimate + region.estimate
-                total_error = total_error + region.error
-
-        if total_estimate is None or total_error is None:
-            raise RuntimeError("integrator has no active regions")
-        return total_estimate, total_error, self._is_finite_result(total_estimate, total_error)
-
-    def _estimate_region(
-        self,
-        region: _Region,
-        region_values: np.ndarray,
-    ) -> tuple[np.ndarray | np.generic, np.ndarray | np.generic]:
-        high_estimate = np.tensordot(region.high_weights, region_values, axes=(0, 0))
-        low_estimate = np.tensordot(region.low_weights, region_values, axes=(0, 0))
-
-        if self.ndim == 1 and self.rule_name in {"gk15", "gk21"}:
-            return high_estimate, self._gauss_kronrod_error(region, region_values, high_estimate, low_estimate)
-        if self.ndim == 1 and self.rule_name == "trapezoid":
-            return high_estimate, np.abs(high_estimate - low_estimate) / 3.0
-
-        return high_estimate, np.abs(high_estimate - low_estimate)
-
-    def _gauss_kronrod_error(
-        self,
-        region: _Region,
-        region_values: np.ndarray,
-        high_estimate: np.ndarray | np.generic,
-        low_estimate: np.ndarray | np.generic,
-    ) -> np.ndarray | np.generic:
-        h = 0.5 * float(region.b[0] - region.a[0])
-        err = np.abs(high_estimate - low_estimate)
-        if h == 0.0:
-            return err
-
-        reshape = (region.high_weights.shape[0],) + (1,) * (region_values.ndim - 1)
-        weighted_high = region.high_weights.reshape(reshape)
-        center_value = high_estimate / (2.0 * h)
-        dabs = np.sum(weighted_high * np.abs(region_values - center_value), axis=0)
-        ratio = np.divide(
-            200.0 * err,
-            dabs,
-            out=np.zeros_like(np.asarray(err, dtype=np.result_type(err, np.float64))),
-            where=dabs != 0,
-        )
-        err = np.where((dabs != 0) & (err != 0), dabs * np.minimum(1.0, ratio**1.5), err)
-
-        abs_integrand = np.sum(weighted_high * np.abs(region_values), axis=0)
-        round_err = np.abs(50.0 * np.finfo(self.dtype).eps * abs_integrand)
-        err = np.where(round_err > np.finfo(self.dtype).tiny, np.maximum(err, round_err), err)
-        return err
-
     def _is_finite_result(self, estimate: np.ndarray | np.generic, error: np.ndarray | np.generic) -> bool:
         return bool(np.all(np.isfinite(np.asarray(estimate))) and np.all(np.isfinite(np.asarray(error))))
 
-    def _converged(self, estimate: np.ndarray, error: np.ndarray, *, atol: float, rtol: float) -> bool:
+    def _converged(self, estimate: np.ndarray | np.generic, error: np.ndarray | np.generic, *, atol: float, rtol: float) -> bool:
         tolerance = atol + rtol * np.abs(estimate)
         return bool(np.all(error <= tolerance))
-
-    def _refine_worst_region(self) -> tuple[_Region, list[_Region]]:
-        worst_index = max(range(len(self._leaf_regions)), key=lambda idx: self._leaf_regions[idx].priority)
-        worst_region = self._leaf_regions.pop(worst_index)
-        midpoint = 0.5 * (worst_region.a + worst_region.b)
-
-        children = []
-        for side in itertools.product((0, 1), repeat=self.ndim):
-            child_a = np.array(worst_region.a, copy=True)
-            child_b = np.array(worst_region.b, copy=True)
-            for axis, upper_half in enumerate(side):
-                if upper_half:
-                    child_a[axis] = midpoint[axis]
-                else:
-                    child_b[axis] = midpoint[axis]
-            children.append(self._build_region(child_a, child_b))
-
-        self._leaf_regions.extend(children)
-        return worst_region, children
-
-    def _split_initial_regions(
-        self,
-        a: np.ndarray,
-        b: np.ndarray,
-        points: list[np.ndarray | list[float] | float] | None,
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
-        if points is None or np.any(a == b):
-            return [(a, b)]
-
-        normalized_points = [self._normalize_point(point) for point in points]
-        regions = [(a, b)]
-
-        for point in normalized_points:
-            new_regions: list[tuple[np.ndarray, np.ndarray]] = []
-            for left, right in regions:
-                if self._is_strictly_in_region(left, right, point):
-                    for child_left, child_right in self._split_subregion(left, right, point):
-                        if np.any(child_left == child_right):
-                            continue
-                        new_regions.append((child_left, child_right))
-                else:
-                    new_regions.append((left, right))
-            regions = new_regions
-
-        return regions
-
-    def _normalize_point(self, point: np.ndarray | list[float] | float) -> np.ndarray:
-        arr = np.asarray(point, dtype=self.dtype)
-        if self.ndim == 1 and arr.ndim == 0:
-            arr = arr.reshape(1)
-        if arr.ndim != 1 or arr.shape[0] != self.ndim:
-            raise ValueError(f"each point must have shape ({self.ndim},)")
-        return np.ascontiguousarray(np.where(arr == 0, self.dtype.type(0), arr))
-
-    def _is_strictly_in_region(self, a: np.ndarray, b: np.ndarray, point: np.ndarray) -> bool:
-        if np.all(point == a) or np.all(point == b):
-            return False
-        return bool(np.all(a <= point) and np.all(point <= b))
-
-    def _split_subregion(
-        self,
-        a: np.ndarray,
-        b: np.ndarray,
-        split_at: np.ndarray,
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
-        left = [np.stack((a[i], split_at[i])) for i in range(self.ndim)]
-        right = [np.stack((split_at[i], b[i])) for i in range(self.ndim)]
-
-        a_sub = self._cartesian_product(left)
-        b_sub = self._cartesian_product(right)
-        return [(a_sub[i].copy(), b_sub[i].copy()) for i in range(a_sub.shape[0])]
-
-    def _cartesian_product(self, arrays: list[np.ndarray]) -> np.ndarray:
-        arrays_ix = np.meshgrid(*arrays, indexing="ij")
-        return np.reshape(np.stack(arrays_ix, axis=-1), (-1, len(arrays)))
 
     def _build_result(
         self,
@@ -467,8 +510,8 @@ class StatefulIntegrator:
             status=status,
             n_kernel_evals=stats.n_kernel_evals,
             n_evaluator_evals=stats.n_evaluator_evals,
-            n_regions=self.n_regions,
-            n_cached_nodes=self.n_cached_nodes,
+            n_leaves=self.n_leaves,
+            n_leaf_nodes=self.n_leaf_nodes,
             subdivisions=stats.subdivisions,
         )
 

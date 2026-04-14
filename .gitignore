@@ -1,4 +1,10 @@
 .pixi/
+pixi.lock
 .venv/
+.pytest_cache/
 __pycache__/
 *.pyc
+build/
+dist/
+*.egg-info/
+tmp/

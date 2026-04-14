@@ -1,12 +1,10 @@
-"""Stateful adaptive quadrature with exact node reuse."""
+"""Leaf-only stateful adaptive cubature."""
 
-from ._compat import CubatureResult, cubature, quad_vec
 from ._integrator import IntegrationResult, StatefulIntegrator
+from ._version import __version__
 
 __all__ = [
-    "CubatureResult",
     "IntegrationResult",
     "StatefulIntegrator",
-    "cubature",
-    "quad_vec",
+    "__version__",
 ]

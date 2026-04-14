@@ -1,4 +1,4 @@
-"""Nested quadrature and cubature rules used by the stateful integrator."""
+"""Quadrature rules for the lean stateful integrator."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from dataclasses import dataclass
 import numpy as np
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class NestedRule:
-    """Fixed nested rule on the reference hypercube ``[-1, 1]^ndim``."""
+    """Fixed embedded rule on the reference hypercube ``[-1, 1]^ndim``."""
 
     name: str
     ndim: int
@@ -19,20 +19,18 @@ class NestedRule:
     high_weights: np.ndarray
     low_weights: np.ndarray
 
+    @property
+    def n_nodes(self) -> int:
+        return int(self.reference_nodes.shape[0])
+
 
 def resolve_rule(name: str, ndim: int, dtype: np.dtype | type = np.float64) -> NestedRule:
-    """Return a built-in nested rule."""
+    """Return a built-in rule supported by ``StatefulIntegrator``."""
 
-    if name == "gk15":
-        base = _gauss_kronrod_15(dtype)
-        return base if ndim == 1 else _product_rule(base, ndim)
     if name == "gk21":
-        base = _gauss_kronrod_21(dtype)
-        return base if ndim == 1 else _product_rule(base, ndim)
-    if name == "trapezoid":
         if ndim != 1:
-            raise ValueError("trapezoid is only supported for 1D integrals")
-        return _trapezoid(dtype)
+            raise ValueError("gk21 is only supported for 1D integrals")
+        return _gauss_kronrod_21(dtype)
     if name == "genz_malik":
         if ndim < 2:
             raise ValueError("genz_malik is only supported for ndim >= 2")
@@ -45,71 +43,19 @@ def map_rule(rule: NestedRule, a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray
 
     a = np.asarray(a, dtype=rule.reference_nodes.dtype)
     b = np.asarray(b, dtype=rule.reference_nodes.dtype)
-    lengths = b - a
-    nodes = (rule.reference_nodes + 1.0) * (lengths * 0.5) + a
-    weight_scale = np.prod(lengths, dtype=rule.reference_nodes.dtype) / (2.0 ** rule.ndim)
-    return nodes, rule.high_weights * weight_scale, rule.low_weights * weight_scale
-
-
-def _gauss_kronrod_15(dtype: np.dtype | type) -> NestedRule:
-    x = np.asarray(
-        [
-            0.9914553711208126,
-            0.9491079123427585,
-            0.8648644233597691,
-            0.7415311855993945,
-            0.5860872354676911,
-            0.4058451513773972,
-            0.20778495500789847,
-            0.0,
-            -0.20778495500789847,
-            -0.4058451513773972,
-            -0.5860872354676911,
-            -0.7415311855993945,
-            -0.8648644233597691,
-            -0.9491079123427585,
-            -0.9914553711208126,
-        ],
-        dtype=dtype,
-    )[:, None]
-    high = np.asarray(
-        [
-            0.022935322010529225,
-            0.06309209262997856,
-            0.10479001032225018,
-            0.14065325971552592,
-            0.1690047266392679,
-            0.19035057806478542,
-            0.20443294007529889,
-            0.20948214108472782,
-            0.20443294007529889,
-            0.19035057806478542,
-            0.1690047266392679,
-            0.14065325971552592,
-            0.10479001032225018,
-            0.06309209262997856,
-            0.022935322010529225,
-        ],
-        dtype=dtype,
+    half_widths = 0.5 * (b - a)
+    centers = 0.5 * (a + b)
+    nodes = centers[None, :] + half_widths[None, :] * rule.reference_nodes
+    weight_scale = np.prod(half_widths, dtype=rule.reference_nodes.dtype)
+    return (
+        np.ascontiguousarray(nodes),
+        np.ascontiguousarray(rule.high_weights * weight_scale),
+        np.ascontiguousarray(rule.low_weights * weight_scale),
     )
-    low = np.zeros_like(high)
-    low[[1, 3, 5, 7, 9, 11, 13]] = np.asarray(
-        [
-            0.1294849661688697,
-            0.27970539148927664,
-            0.3818300505051189,
-            0.4179591836734694,
-            0.3818300505051189,
-            0.27970539148927664,
-            0.1294849661688697,
-        ],
-        dtype=dtype,
-    )
-    return NestedRule("gk15", 1, x, high, low)
 
 
 def _gauss_kronrod_21(dtype: np.dtype | type) -> NestedRule:
-    x = np.asarray(
+    reference_nodes = np.asarray(
         [
             0.9956571630258081,
             0.9739065285171717,
@@ -135,7 +81,7 @@ def _gauss_kronrod_21(dtype: np.dtype | type) -> NestedRule:
         ],
         dtype=dtype,
     )[:, None]
-    high = np.asarray(
+    high_weights = np.asarray(
         [
             0.011694638867371874,
             0.03255816230796473,
@@ -161,8 +107,8 @@ def _gauss_kronrod_21(dtype: np.dtype | type) -> NestedRule:
         ],
         dtype=dtype,
     )
-    low = np.zeros_like(high)
-    low[[1, 3, 5, 7, 9, 11, 13, 15, 17, 19]] = np.asarray(
+    low_weights = np.zeros_like(high_weights)
+    low_weights[[1, 3, 5, 7, 9, 11, 13, 15, 17, 19]] = np.asarray(
         [
             0.06667134430868814,
             0.1494513491505806,
@@ -177,7 +123,7 @@ def _gauss_kronrod_21(dtype: np.dtype | type) -> NestedRule:
         ],
         dtype=dtype,
     )
-    return NestedRule("gk21", 1, x, high, low)
+    return NestedRule("gk21", 1, np.ascontiguousarray(reference_nodes), high_weights, low_weights)
 
 
 def _genz_malik(ndim: int, dtype: np.dtype | type) -> NestedRule:
@@ -207,7 +153,7 @@ def _genz_malik(ndim: int, dtype: np.dtype | type) -> NestedRule:
     w_4 = (2.0**ndim) * 200.0 / 19683.0
     w_5 = 6859.0 / 19683.0
 
-    high = np.concatenate(
+    high_weights = np.concatenate(
         [
             np.full(1, w_1, dtype=dtype),
             np.full(2 * ndim, w_2, dtype=dtype),
@@ -222,7 +168,7 @@ def _genz_malik(ndim: int, dtype: np.dtype | type) -> NestedRule:
     low_w_3 = (2.0**ndim) * (265.0 - 100.0 * ndim) / 1458.0
     low_w_4 = (2.0**ndim) * 25.0 / 729.0
 
-    low = np.concatenate(
+    low_weights = np.concatenate(
         [
             np.full(1, low_w_1, dtype=dtype),
             np.full(2 * ndim, low_w_2, dtype=dtype),
@@ -232,25 +178,13 @@ def _genz_malik(ndim: int, dtype: np.dtype | type) -> NestedRule:
         ]
     )
 
-    return NestedRule("genz_malik", ndim, reference_nodes, high, low)
-
-
-def _product_rule(base_rule: NestedRule, ndim: int) -> NestedRule:
-    index_grid = np.asarray(list(itertools.product(range(base_rule.reference_nodes.shape[0]), repeat=ndim)))
-    reference_nodes = np.stack(
-        [base_rule.reference_nodes[index_grid[:, axis], 0] for axis in range(ndim)],
-        axis=-1,
-    ).astype(base_rule.reference_nodes.dtype, copy=False)
-    high = np.prod(base_rule.high_weights[index_grid], axis=1, dtype=base_rule.high_weights.dtype)
-    low = np.prod(base_rule.low_weights[index_grid], axis=1, dtype=base_rule.low_weights.dtype)
-    return NestedRule(base_rule.name, ndim, reference_nodes, high, low)
-
-
-def _trapezoid(dtype: np.dtype | type) -> NestedRule:
-    x = np.asarray([1.0, 0.0, -1.0], dtype=dtype)[:, None]
-    high = np.asarray([0.5, 1.0, 0.5], dtype=dtype)
-    low = np.asarray([1.0, 0.0, 1.0], dtype=dtype)
-    return NestedRule("trapezoid", 1, x, high, low)
+    return NestedRule(
+        "genz_malik",
+        ndim,
+        np.ascontiguousarray(reference_nodes),
+        np.ascontiguousarray(high_weights),
+        np.ascontiguousarray(low_weights),
+    )
 
 
 def _distinct_permutations(values: tuple[float, ...]):
@@ -258,19 +192,22 @@ def _distinct_permutations(values: tuple[float, ...]):
 
     items = sorted(values)
     size = len(items)
+    used = [False] * size
+    current = [0.0] * size
 
-    while True:
-        yield tuple(items)
-
-        for i in range(size - 2, -1, -1):
-            if items[i] < items[i + 1]:
-                break
-        else:
+    def visit(depth: int):
+        if depth == size:
+            yield tuple(current)
             return
 
-        for j in range(size - 1, i, -1):
-            if items[i] < items[j]:
-                break
+        previous = None
+        for index, value in enumerate(items):
+            if used[index] or value == previous:
+                continue
+            used[index] = True
+            current[depth] = value
+            yield from visit(depth + 1)
+            used[index] = False
+            previous = value
 
-        items[i], items[j] = items[j], items[i]
-        items[i + 1 :] = items[: i - size : -1]
+    yield from visit(0)

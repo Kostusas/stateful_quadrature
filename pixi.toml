@@ -6,6 +6,8 @@ version = "0.1.0"
 
 [tasks]
 test = "python -m unittest discover -s tests -v"
+example = "python -m examples.basic_usage"
+benchmark-quick = "python benchmarks/compare_scipy.py --mode quick"
 
 [dependencies]
 python = ">=3.11,<3.15"

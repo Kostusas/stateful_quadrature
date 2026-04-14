@@ -10,6 +10,24 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.0"]
 authors = [{ name = "Kostas Vilkelis" }]
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+keywords = ["quadrature", "cubature", "integration", "numerics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kostusas/stateful_quadrature"
+Repository = "https://github.com/Kostusas/stateful_quadrature"
+Issues = "https://github.com/Kostusas/stateful_quadrature/issues"
 
 [tool.setuptools.packages.find]
 include = ["stateful_quadrature*"]

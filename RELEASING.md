@@ -31,7 +31,7 @@ This repository is currently GitHub-source-install and Pixi centric.
 3. After the final commit, create a tag for the version you want users to install from:
 
    ```bash
-   git tag v0.1.0
+   git tag v0.2.0
    git push origin main --tags
    ```
 

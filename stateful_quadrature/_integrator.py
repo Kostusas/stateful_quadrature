@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -13,7 +14,9 @@ from ._rules import NestedRule, resolve_rule
 
 
 Kernel = Callable[[np.ndarray], np.ndarray]
-Evaluator = Callable[[np.ndarray, np.ndarray, Any], np.ndarray]
+PayloadBuilder = Callable[[np.ndarray, np.ndarray], Iterable[Any]]
+Evaluator = Callable[[np.ndarray, np.ndarray | list[Any], Any], np.ndarray]
+LeafPayload = np.ndarray | tuple[Any, ...]
 
 
 @dataclass(slots=True)
@@ -49,7 +52,7 @@ class _Leaf:
     leaf_id: int
     a: np.ndarray
     b: np.ndarray
-    payload: np.ndarray | None = None
+    payload: LeafPayload | None = None
     estimate: np.ndarray | np.generic | None = None
     error: np.ndarray | np.generic | None = None
     priority: float = field(default=float("inf"))
@@ -67,6 +70,7 @@ class StatefulIntegrator:
         rule: str = "auto",
         dtype: np.dtype | type = np.float64,
         batch_size: int | None = None,
+        payload_builder: PayloadBuilder | None = None,
     ) -> None:
         """Create a stateful integrator on a finite rectangular domain.
 
@@ -75,16 +79,22 @@ class StatefulIntegrator:
             b: Upper integration bounds. Bounds must be finite.
             kernel: Expensive callback evaluated at rule nodes. It must return a numeric array
                 whose leading dimension matches the input batch size.
-            evaluator: Cheap callback that combines points, cached kernel payloads, and the
-                parameter object passed to ``integrate(...)``.
+            evaluator: Cheap callback that combines points, cached payloads, and the parameter
+                object passed to ``integrate(...)``. When ``payload_builder`` is ``None``, cached
+                payloads are numeric arrays. Otherwise the evaluator receives a Python ``list`` of
+                prepared per-node payload objects aligned with ``points``.
             rule: ``"auto"``, ``"gk21"``, or ``"genz_malik"``. ``"auto"`` selects ``"gk21"``
                 in 1D and ``"genz_malik"`` otherwise.
             dtype: Floating-point dtype used for the integration domain and rule weights.
             batch_size: Optional maximum number of points passed to ``kernel`` and ``evaluator``
                 per callback invocation.
+            payload_builder: Optional callback that runs once for newly created rule nodes. It
+                receives the flattened node batch and the raw numeric ``kernel`` payloads, and
+                must return one prepared payload object per input point.
         """
         self.kernel = kernel
         self.evaluator = evaluator
+        self.payload_builder = payload_builder
         self.dtype = np.dtype(dtype)
         self.batch_size = batch_size
 
@@ -128,14 +138,15 @@ class StatefulIntegrator:
     def replace_evaluator(self, evaluator: Evaluator) -> "StatefulIntegrator":
         """Return a new integrator sharing the current live leaf payloads.
 
-        The clone starts from the current adaptive mesh snapshot, reuses cached kernel payloads,
-        and resets only evaluator-dependent state. Future refinement happens independently in the
+        The clone starts from the current adaptive mesh snapshot, reuses cached leaf payloads, and
+        resets only evaluator-dependent state. Future refinement happens independently in the
         original and cloned integrators.
         """
 
         clone = object.__new__(StatefulIntegrator)
         clone.kernel = self.kernel
         clone.evaluator = evaluator
+        clone.payload_builder = self.payload_builder
         clone.dtype = self.dtype
         clone.batch_size = self.batch_size
         clone._orientation_sign = self._orientation_sign
@@ -268,7 +279,14 @@ class StatefulIntegrator:
         if not pending:
             return
 
-        for batch_ids in self._iter_leaf_batches(pending):
+        if self.payload_builder is None:
+            self._ensure_numeric_leaf_payloads(pending, stats)
+            return
+
+        self._ensure_prepared_leaf_payloads(pending, stats)
+
+    def _ensure_numeric_leaf_payloads(self, leaf_ids: list[int], stats: _CallStats) -> None:
+        for batch_ids in self._iter_leaf_batches(leaf_ids):
             batch = [self._leaves[leaf_id] for leaf_id in batch_ids]
             centers, half_widths = self._leaf_geometry(batch)
             nodes = self._map_nodes_batch(centers, half_widths)
@@ -276,6 +294,20 @@ class StatefulIntegrator:
             payloads = payloads.reshape((len(batch), self._n_rule_nodes) + self._payload_shape)
             for index, leaf in enumerate(batch):
                 leaf.payload = np.array(payloads[index], copy=True)
+
+    def _ensure_prepared_leaf_payloads(self, leaf_ids: list[int], stats: _CallStats) -> None:
+        for batch_ids in self._iter_leaf_batches(leaf_ids):
+            batch = [self._leaves[leaf_id] for leaf_id in batch_ids]
+            centers, half_widths = self._leaf_geometry(batch)
+            nodes = self._map_nodes_batch(centers, half_widths)
+            flat_nodes = nodes.reshape(-1, self.ndim)
+            raw_payloads = self._call_kernel(flat_nodes, stats)
+            prepared_payloads = self._call_payload_builder(flat_nodes, raw_payloads)
+
+            for index, leaf in enumerate(batch):
+                start = index * self._n_rule_nodes
+                stop = start + self._n_rule_nodes
+                leaf.payload = tuple(prepared_payloads[start:stop])
 
     def _refresh_leaves(
         self,
@@ -294,15 +326,11 @@ class StatefulIntegrator:
             centers, half_widths = self._leaf_geometry(batch)
             scales = np.prod(half_widths, axis=1, dtype=self.dtype)
             nodes = self._map_nodes_batch(centers, half_widths)
-            payloads = np.stack([leaf.payload for leaf in batch], axis=0)
 
-            values = self._call_evaluator(
-                nodes.reshape(-1, self.ndim),
-                payloads.reshape((len(batch) * self._n_rule_nodes,) + self._payload_shape),
-                params,
-                stats,
-            )
-            values = values.reshape((len(batch), self._n_rule_nodes) + self._value_shape)
+            if self.payload_builder is None:
+                values = self._evaluate_numeric_leaf_batch(batch, nodes, params, stats)
+            else:
+                values = self._evaluate_prepared_leaf_batch(batch, nodes, params, stats)
 
             estimates, errors = self._estimate_leaf_batch(half_widths, scales, values)
             batch_estimate_total = np.sum(estimates, axis=0)
@@ -326,6 +354,36 @@ class StatefulIntegrator:
             heapq.heapify(self._leaf_heap)
 
         return total_estimate, total_error, self._is_finite_result(total_estimate, total_error)
+
+    def _evaluate_numeric_leaf_batch(
+        self,
+        leaves: list[_Leaf],
+        nodes: np.ndarray,
+        params: Any,
+        stats: _CallStats,
+    ) -> np.ndarray:
+        if self._payload_shape is None:
+            raise RuntimeError("kernel payload shape is unknown")
+
+        payloads = np.stack([np.asarray(leaf.payload) for leaf in leaves], axis=0)
+        values = self._call_numeric_evaluator(
+            nodes.reshape(-1, self.ndim),
+            payloads.reshape((len(leaves) * self._n_rule_nodes,) + self._payload_shape),
+            params,
+            stats,
+        )
+        return values.reshape((len(leaves), self._n_rule_nodes) + self._value_shape)
+
+    def _evaluate_prepared_leaf_batch(
+        self,
+        leaves: list[_Leaf],
+        nodes: np.ndarray,
+        params: Any,
+        stats: _CallStats,
+    ) -> np.ndarray:
+        payloads = self._flatten_prepared_payloads(leaves)
+        values = self._call_prepared_evaluator(nodes.reshape(-1, self.ndim), payloads, params, stats)
+        return values.reshape((len(leaves), self._n_rule_nodes) + self._value_shape)
 
     def _leaf_geometry(self, leaves: list[_Leaf]) -> tuple[np.ndarray, np.ndarray]:
         a = np.stack([leaf.a for leaf in leaves], axis=0)
@@ -443,7 +501,25 @@ class StatefulIntegrator:
             stats.n_kernel_evals += chunk.shape[0]
         return np.concatenate(outputs, axis=0)
 
-    def _call_evaluator(
+    def _call_payload_builder(self, points: np.ndarray, raw_payloads: np.ndarray) -> list[Any]:
+        if self.payload_builder is None:
+            raise RuntimeError("payload_builder is not configured")
+
+        try:
+            prepared_payloads = list(self.payload_builder(points, raw_payloads))
+        except TypeError as exc:
+            raise TypeError(
+                "payload_builder must return an iterable with one prepared payload per input point"
+            ) from exc
+
+        if len(prepared_payloads) != points.shape[0]:
+            raise ValueError(
+                "payload_builder must return one prepared payload per input point, "
+                f"got {len(prepared_payloads)} for {points.shape[0]} points"
+            )
+        return prepared_payloads
+
+    def _call_numeric_evaluator(
         self,
         points: np.ndarray,
         payloads: np.ndarray,
@@ -454,6 +530,27 @@ class StatefulIntegrator:
         for chunk_points, chunk_payloads in zip(
             self._iter_chunks(points),
             self._iter_chunks(payloads),
+            strict=True,
+        ):
+            values = np.asarray(self.evaluator(chunk_points, chunk_payloads, params))
+            values = self._validate_batch_output("evaluator", values, chunk_points.shape[0], self._value_shape)
+            if self._value_shape is None:
+                self._value_shape = values.shape[1:]
+            outputs.append(values)
+            stats.n_evaluator_evals += chunk_points.shape[0]
+        return np.concatenate(outputs, axis=0)
+
+    def _call_prepared_evaluator(
+        self,
+        points: np.ndarray,
+        payloads: list[Any],
+        params: Any,
+        stats: _CallStats,
+    ) -> np.ndarray:
+        outputs: list[np.ndarray] = []
+        for chunk_points, chunk_payloads in zip(
+            self._iter_chunks(points),
+            self._iter_payload_chunks(payloads),
             strict=True,
         ):
             values = np.asarray(self.evaluator(chunk_points, chunk_payloads, params))
@@ -489,6 +586,21 @@ class StatefulIntegrator:
             return
         for start in range(0, values.shape[0], self.batch_size):
             yield values[start : start + self.batch_size]
+
+    def _iter_payload_chunks(self, values: list[Any]):
+        if self.batch_size is None:
+            yield values
+            return
+        for start in range(0, len(values), self.batch_size):
+            yield values[start : start + self.batch_size]
+
+    def _flatten_prepared_payloads(self, leaves: list[_Leaf]) -> list[Any]:
+        payloads: list[Any] = []
+        for leaf in leaves:
+            if leaf.payload is None:
+                raise RuntimeError("leaf payloads must be available before evaluation")
+            payloads.extend(leaf.payload)
+        return payloads
 
     def _is_finite_result(self, estimate: np.ndarray | np.generic, error: np.ndarray | np.generic) -> bool:
         return bool(np.all(np.isfinite(np.asarray(estimate))) and np.all(np.isfinite(np.asarray(error))))

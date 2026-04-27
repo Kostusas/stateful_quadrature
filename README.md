@@ -9,7 +9,8 @@ where `K(x)` is expensive, independent of `lambda`, and worth caching exactly.
 
 The package is intentionally small. Its public surface centers on
 `stateful_quadrature.StatefulIntegrator`, which keeps a live adaptive leaf mesh and reuses cached
-kernel payloads exactly across repeated calls.
+kernel payloads exactly across repeated calls. It can also prepare mutable per-node payload
+objects once and reuse them across later integrations.
 
 The package is inspired by [SciPy's cubature](https://docs.scipy.org/doc/scipy/reference/generated/scipy.integrate.cubature.html) function.
 
@@ -17,14 +18,16 @@ The package is inspired by [SciPy's cubature](https://docs.scipy.org/doc/scipy/r
 
 - adaptive finite-domain quadrature on rectangular regions,
 - exact per-leaf kernel reuse across repeated integrations,
+- optional one-time prepared payload building for mutable node-local state,
 - scalar, vector, matrix, complex, and fixed-shape tensor outputs,
 - built-in `gk21` for 1D integrals,
 - built-in `genz_malik` for `ndim >= 2`.
 
-Each active leaf stores only its bounds, cached kernel payloads at that leaf's rule nodes, and
-its current estimate and error. When the parameters change, the mesh is reused as-is: cached
-payloads stay valid, the cheap evaluator is recomputed on the current leaves, and refinement only
-continues if the new parameter still fails tolerance.
+Each active leaf stores only its bounds, cached payloads at that leaf's rule nodes, and its
+current estimate and error. Cached payloads can be raw numeric kernel arrays or prepared per-node
+objects. When the parameters change, the mesh is reused as-is: cached payloads stay valid, the
+cheap evaluator is recomputed on the current leaves, and refinement only continues if the new
+parameter still fails tolerance.
 
 ## Current Limits
 
@@ -94,6 +97,45 @@ An executable copy of this example lives in
 [`examples/basic_usage.py`](https://github.com/Kostusas/stateful_quadrature/blob/main/examples/basic_usage.py)
 and can be run from a clone with `pixi run example`.
 
+## Prepared Payloads
+
+If raw numeric kernel data should be turned into mutable node-local state once, pass a
+`payload_builder`:
+
+```python
+import numpy as np
+
+from stateful_quadrature import StatefulIntegrator
+
+
+def kernel(points):
+    return points[:, 0]
+
+
+def payload_builder(points, raw_payloads):
+    return [{"value": float(value), "history": []} for value in raw_payloads]
+
+
+def evaluator(points, payloads, scale):
+    return np.array([scale * payload["value"] for payload in payloads])
+
+
+integrator = StatefulIntegrator(
+    a=[0.0],
+    b=[1.0],
+    kernel=kernel,
+    evaluator=evaluator,
+    payload_builder=payload_builder,
+)
+```
+
+`kernel` still returns numeric arrays. `payload_builder(points, raw_payloads)` runs only when new
+rule nodes are created and must return one prepared payload object per input point. The evaluator
+then receives a Python `list` of prepared payloads aligned with `points`.
+
+Repeated `integrate(...)` calls reuse the same prepared payload objects on the live mesh, and
+`replace_evaluator(...)` shallow-shares those objects into the cloned integrator.
+
 ## Reusing The Live Mesh
 
 If a second integral uses the same kernel but a different evaluator, clone the live mesh with:
@@ -103,7 +145,7 @@ other = integrator.replace_evaluator(other_evaluator)
 ```
 
 The new integrator shares the current leaf payload cache but can refine independently from that
-point onward.
+point onward. This applies to both numeric payload arrays and prepared payload objects.
 
 `integrate(...)` accepts either a single `params` object or keyword arguments. Keyword arguments
 are bundled into a dictionary and passed to the evaluator as the third argument.

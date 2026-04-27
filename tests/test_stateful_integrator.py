@@ -372,3 +372,204 @@ class ReuseTests(unittest.TestCase):
         self.assertEqual(result.status, "converged")
         self.assertEqual(result.n_kernel_evals, 0)
         self.assertEqual(result.estimate.shape[-1], 2)
+
+
+class PreparedPayloadTests(unittest.TestCase):
+    def test_prepared_payloads_support_basic_convergence(self) -> None:
+        def kernel(points: np.ndarray) -> np.ndarray:
+            return points[:, 0]
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, float]]:
+            return [{"value": float(value)} for value in raw_payloads]
+
+        def evaluator(points: np.ndarray, payloads: list[dict[str, float]], power: float) -> np.ndarray:
+            return np.array([payload["value"] ** power for payload in payloads])
+
+        integrator = StatefulIntegrator(
+            a=[0.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=evaluator,
+            batch_size=8,
+            payload_builder=payload_builder,
+        )
+        result = integrator.integrate(2.0, atol=1e-10, rtol=1e-10)
+
+        self.assertEqual(result.status, "converged")
+        np.testing.assert_allclose(result.estimate, 1.0 / 3.0, rtol=0.0, atol=1e-10)
+
+    def test_prepared_payload_builder_is_skipped_when_mesh_is_reused(self) -> None:
+        builder_calls = 0
+        built_points = 0
+
+        def kernel(points: np.ndarray) -> np.ndarray:
+            x = points[:, 0]
+            return np.stack([np.sin(x), np.cos(x)], axis=-1)
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, float]]:
+            nonlocal builder_calls, built_points
+            builder_calls += 1
+            built_points += points.shape[0]
+            return [
+                {"sin": float(raw_payload[0]), "cos": float(raw_payload[1])}
+                for raw_payload in raw_payloads
+            ]
+
+        def evaluator(points: np.ndarray, payloads: list[dict[str, float]], params: tuple[float, float]) -> np.ndarray:
+            alpha, beta = params
+            return np.array([alpha * payload["sin"] + beta * payload["cos"] for payload in payloads])
+
+        integrator = StatefulIntegrator(
+            a=[-1.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=evaluator,
+            batch_size=8,
+            payload_builder=payload_builder,
+        )
+
+        first = integrator.integrate((1.0, -0.25), atol=1e-10, rtol=1e-10)
+        builder_calls_after_first = builder_calls
+        built_points_after_first = built_points
+        second = integrator.integrate((0.5, 1.5), atol=1e-10, rtol=1e-10)
+
+        np.testing.assert_allclose(first.estimate, -0.5 * math.sin(1.0), atol=1e-11, rtol=0.0)
+        np.testing.assert_allclose(second.estimate, 3.0 * math.sin(1.0), atol=1e-11, rtol=0.0)
+        self.assertEqual(second.n_kernel_evals, 0)
+        self.assertEqual(builder_calls, builder_calls_after_first)
+        self.assertEqual(built_points, built_points_after_first)
+
+    def test_prepared_payload_builder_only_runs_for_new_child_leaves(self) -> None:
+        rule_nodes = resolve_rule("gk21", ndim=1).n_nodes
+        built_points = 0
+
+        def kernel(points: np.ndarray) -> np.ndarray:
+            return points[:, 0]
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, float]]:
+            nonlocal built_points
+            built_points += points.shape[0]
+            return [{"value": float(value)} for value in raw_payloads]
+
+        def evaluator(points: np.ndarray, payloads: list[dict[str, float]], omega: float) -> np.ndarray:
+            return np.array([math.cos(omega * payload["value"]) for payload in payloads])
+
+        integrator = StatefulIntegrator(
+            a=[-1.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=evaluator,
+            batch_size=16,
+            payload_builder=payload_builder,
+        )
+
+        easy = integrator.integrate(1.0, atol=1e-8, rtol=1e-8)
+        built_points_after_easy = built_points
+        hard = integrator.integrate(25.0, atol=1e-10, rtol=1e-10, max_subdivisions=512)
+
+        self.assertEqual(hard.status, "converged")
+        self.assertGreater(hard.subdivisions, 0)
+        self.assertEqual(hard.n_kernel_evals, 2 * rule_nodes * hard.subdivisions)
+        self.assertEqual(hard.n_leaf_nodes - easy.n_leaf_nodes, rule_nodes * hard.subdivisions)
+        self.assertEqual(built_points - built_points_after_easy, hard.n_kernel_evals)
+        np.testing.assert_allclose(hard.estimate, 2.0 * math.sin(25.0) / 25.0, atol=1e-9, rtol=0.0)
+
+    def test_replace_evaluator_reuses_live_prepared_payloads(self) -> None:
+        def kernel(points: np.ndarray) -> np.ndarray:
+            x = points[:, 0]
+            return np.stack([np.sin(x), np.cos(x)], axis=-1)
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, float]]:
+            return [
+                {"sin": float(raw_payload[0]), "cos": float(raw_payload[1])}
+                for raw_payload in raw_payloads
+            ]
+
+        def charge_evaluator(points: np.ndarray, payloads: list[dict[str, float]], alpha: float) -> np.ndarray:
+            return np.array(
+                [[payload["sin"] + alpha * payload["cos"], payload["cos"]] for payload in payloads]
+            )
+
+        def density_evaluator(points: np.ndarray, payloads: list[dict[str, float]], alpha: float) -> np.ndarray:
+            values = np.array([payload["sin"] + alpha * payload["cos"] for payload in payloads])
+            return values[:, None, None]
+
+        charge_integrator = StatefulIntegrator(
+            a=[-1.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=charge_evaluator,
+            payload_builder=payload_builder,
+        )
+        charge_result = charge_integrator.integrate(0.5, atol=1e-10, rtol=1e-10)
+
+        density_integrator = charge_integrator.replace_evaluator(density_evaluator)
+        density_result = density_integrator.integrate(0.5, atol=1e-10, rtol=1e-10)
+
+        self.assertEqual(density_result.status, "converged")
+        self.assertEqual(density_result.n_kernel_evals, 0)
+        self.assertEqual(density_result.n_leaves, charge_result.n_leaves)
+        self.assertEqual(density_result.n_leaf_nodes, charge_result.n_leaf_nodes)
+        self.assertEqual(density_result.estimate.shape, (1, 1))
+
+    def test_prepared_payload_mutations_are_visible_after_clone(self) -> None:
+        def kernel(points: np.ndarray) -> np.ndarray:
+            return points[:, 0]
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, Any]]:
+            return [{"value": float(value), "history": []} for value in raw_payloads]
+
+        def first_evaluator(points: np.ndarray, payloads: list[dict[str, Any]], scale: float) -> np.ndarray:
+            values = []
+            for payload in payloads:
+                payload["history"].append(("first", scale))
+                values.append(scale * payload["value"])
+            return np.array(values)
+
+        def second_evaluator(points: np.ndarray, payloads: list[dict[str, Any]], shift: float) -> np.ndarray:
+            values = []
+            for payload in payloads:
+                payload["history"].append(("second", shift))
+                values.append(payload["value"] + shift)
+            return np.array(values)
+
+        first = StatefulIntegrator(
+            a=[0.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=first_evaluator,
+            payload_builder=payload_builder,
+        )
+        first_result = first.integrate(2.0, atol=1e-10, rtol=1e-10)
+        original_payload = next(iter(first._leaves.values())).payload[0]
+
+        second = first.replace_evaluator(second_evaluator)
+        second_result = second.integrate(3.0, atol=1e-10, rtol=1e-10)
+        cloned_payload = next(iter(second._leaves.values())).payload[0]
+
+        self.assertEqual(first_result.status, "converged")
+        self.assertEqual(second_result.status, "converged")
+        self.assertEqual(second_result.n_kernel_evals, 0)
+        self.assertIs(original_payload, cloned_payload)
+        self.assertEqual(original_payload["history"], [("first", 2.0), ("second", 3.0)])
+
+    def test_payload_builder_must_return_one_payload_per_point(self) -> None:
+        def kernel(points: np.ndarray) -> np.ndarray:
+            return points[:, 0]
+
+        def payload_builder(points: np.ndarray, raw_payloads: np.ndarray) -> list[dict[str, float]]:
+            return [{"value": float(raw_payloads[0])}]
+
+        def evaluator(points: np.ndarray, payloads: list[dict[str, float]], params: object) -> np.ndarray:
+            return np.array([payload["value"] for payload in payloads])
+
+        integrator = StatefulIntegrator(
+            a=[0.0],
+            b=[1.0],
+            kernel=kernel,
+            evaluator=evaluator,
+            payload_builder=payload_builder,
+        )
+
+        with self.assertRaisesRegex(ValueError, "payload_builder must return one prepared payload per input point"):
+            integrator.integrate(atol=0.0, rtol=0.0)

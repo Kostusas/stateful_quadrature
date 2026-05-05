@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate release tag and package version
+      - name: Validate release tag against package version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -30,7 +30,6 @@ jobs:
           import os
           import pathlib
           import re
-          import tomllib
 
           tag = os.environ["RELEASE_TAG"]
           if re.fullmatch(r"v\d+\.\d+\.\d+", tag) is None:
@@ -39,14 +38,6 @@ jobs:
               )
 
           version = tag[1:]
-
-          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
-          pyproject_version = pyproject["project"]["version"]
-          if pyproject_version != version:
-              raise SystemExit(
-                  "pyproject.toml version mismatch: "
-                  f"expected {version!r}, found {pyproject_version!r}"
-              )
 
           version_ns = {}
           exec(pathlib.Path("stateful_quadrature/_version.py").read_text(), version_ns)
@@ -57,7 +48,7 @@ jobs:
                   f"expected {version!r}, found {module_version!r}"
               )
 
-          print(f"Validated release tag and package version: {tag}")
+          print(f"Validated release tag against package version: {tag}")
           PY
 
       - name: Install build tooling

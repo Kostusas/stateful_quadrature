@@ -40,10 +40,10 @@ parameter still fails tolerance.
 
 ## Installation
 
-Install the latest source from GitHub:
+Install from PyPI:
 
 ```bash
-python -m pip install git+https://github.com/Kostusas/stateful_quadrature.git
+python -m pip install stateful-quadrature
 ```
 
 For local development in a clone, prefer Pixi:

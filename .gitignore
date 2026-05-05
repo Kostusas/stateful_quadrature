@@ -1,10 +1,16 @@
 .pixi/
 pixi.lock
 .venv/
+.vscode/
 .pytest_cache/
+.coverage
+.DS_Store
+.mypy_cache/
+.ruff_cache/
 __pycache__/
 *.pyc
 build/
 dist/
 *.egg-info/
 tmp/
+AGENTS.md

@@ -1,6 +1,6 @@
 # Maintainer Workflow
 
-This repository is currently GitHub-source-install and Pixi centric.
+This repository is PyPI-publish and Pixi centric.
 
 ## Local Workflow
 
@@ -25,22 +25,32 @@ This repository is currently GitHub-source-install and Pixi centric.
 2. Keep the README install path pointed at:
 
    ```bash
-   python -m pip install git+https://github.com/Kostusas/stateful_quadrature.git
+   python -m pip install stateful-quadrature
    ```
 
-3. After the final commit, create a tag for the version you want users to install from:
+3. Push the release commit and matching version tag:
 
    ```bash
    git tag v0.2.0
    git push origin main --tags
    ```
 
-4. If you publish a GitHub release, attach notes there. A package index release can be added
-   later when the project is ready for that distribution path.
+4. Create and publish a GitHub Release for the same tag. The repository workflow at
+   `.github/workflows/publish.yml` only runs for published releases.
+5. Approve the protected GitHub Actions environment named `pypi`.
 
-## Notes
+## External Setup
 
-- The benchmark script under `benchmarks/` is optional developer tooling and is not part of the
-  package runtime dependency set.
-- The packaging metadata is kept valid so `pip install git+...` works cleanly from the GitHub
-  repository, even though package-index publication is intentionally deferred.
+1. In GitHub repository settings, create an environment named `pypi`.
+2. Add required reviewer protection to that environment.
+3. In PyPI account publishing settings, create a pending publisher with:
+
+   ```text
+   PyPI project name: stateful-quadrature
+   Owner: Kostusas
+   Repository name: stateful_quadrature
+   Workflow name: publish.yml
+   Environment name: pypi
+   ```
+
+4. Do not store a long-lived PyPI API token in GitHub Secrets for this flow.

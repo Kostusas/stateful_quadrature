@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stateful-quadrature"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Stateful adaptive quadrature with exact node reuse."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,3 +31,6 @@ Issues = "https://github.com/Kostusas/stateful_quadrature/issues"
 
 [tool.setuptools.packages.find]
 include = ["stateful_quadrature*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "stateful_quadrature._version.__version__" }

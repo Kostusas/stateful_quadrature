@@ -20,8 +20,7 @@ This repository is PyPI-publish and Pixi centric.
 
 ## Versioning And GitHub Releases
 
-1. Update `stateful_quadrature/_version.py`, `pyproject.toml`, and any relevant docs when the
-   version changes.
+1. Update `stateful_quadrature/_version.py` and any relevant docs when the version changes.
 2. Keep the README install path pointed at:
 
    ```bash
@@ -31,7 +30,13 @@ This repository is PyPI-publish and Pixi centric.
 3. Push the release commit and matching version tag:
 
    ```bash
-   git tag v0.2.0
+   VERSION=$(python3 - <<'PY'
+   version_ns = {}
+   exec(open("stateful_quadrature/_version.py").read(), version_ns)
+   print(version_ns["__version__"])
+   PY
+   )
+   git tag "v$VERSION"
    git push origin main --tags
    ```
 
